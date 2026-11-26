@@ -6,12 +6,12 @@ import typing
 from contextlib import nullcontext
 
 if typing.TYPE_CHECKING:
-    import pytest
     from colour.hints import ModuleType
 
 from itertools import product
 
 import numpy as np
+import pytest
 
 from colour.constants import TOLERANCE_ABSOLUTE_TESTS
 from colour.models.rgb.ycbcr import (
@@ -51,6 +51,7 @@ __all__ = [
     "TestOffsetYCbCr",
     "TestRGB_to_YCbCr",
     "TestYCbCr_to_RGB",
+    "TestBroadcastYCbCrRoundTrip",
     "TestRGB_to_YcCbcCrc",
     "TestYcCbcCrc_to_RGB",
 ]
@@ -582,6 +583,420 @@ class TestYCbCr_to_RGB:
         cases = [-1.0, 0.0, 1.0, -np.inf, np.inf, np.nan]
         cases = np.array(list(set(product(cases, repeat=3))))
         YCbCr_to_RGB(cases)
+
+
+BROADCAST_CODE_WORD_PARAMS = [
+    pytest.param(
+        8,
+        np.array([0.0, 0.0, 0.0]),
+        np.array([16, 128, 128]),
+        id="8bit-black",
+    ),
+    pytest.param(
+        8,
+        np.array([0.5, 0.5, 0.5]),
+        np.array([126, 128, 128]),
+        id="8bit-half-gray",
+    ),
+    pytest.param(
+        8,
+        np.array([1.0, 1.0, 1.0]),
+        np.array([235, 128, 128]),
+        id="8bit-white",
+    ),
+    pytest.param(
+        8,
+        np.array([1.0, 0.0, 0.0]),
+        np.array([63, 102, 240]),
+        id="8bit-red",
+    ),
+    pytest.param(
+        8,
+        np.array([0.0, 1.0, 0.0]),
+        np.array([173, 42, 26]),
+        id="8bit-green",
+    ),
+    pytest.param(
+        8,
+        np.array([0.0, 0.0, 1.0]),
+        np.array([32, 240, 118]),
+        id="8bit-blue",
+    ),
+    pytest.param(
+        8,
+        np.array([0.75, 0.5, 0.25]),
+        np.array([133, 94, 159]),
+        id="8bit-interior-ramp",
+    ),
+    pytest.param(
+        10,
+        np.array([0.0, 0.0, 0.0]),
+        np.array([64, 512, 512]),
+        id="10bit-black",
+    ),
+    pytest.param(
+        10,
+        np.array([0.5, 0.5, 0.5]),
+        np.array([502, 512, 512]),
+        id="10bit-half-gray",
+    ),
+    pytest.param(
+        10,
+        np.array([1.0, 1.0, 1.0]),
+        np.array([940, 512, 512]),
+        id="10bit-white",
+    ),
+    pytest.param(
+        10,
+        np.array([1.0, 0.0, 0.0]),
+        np.array([250, 409, 960]),
+        id="10bit-red",
+    ),
+    pytest.param(
+        10,
+        np.array([0.0, 1.0, 0.0]),
+        np.array([691, 167, 105]),
+        id="10bit-green",
+    ),
+    pytest.param(
+        10,
+        np.array([0.0, 0.0, 1.0]),
+        np.array([127, 960, 471]),
+        id="10bit-blue",
+    ),
+    pytest.param(
+        10,
+        np.array([0.75, 0.5, 0.25]),
+        np.array([533, 374, 634]),
+        id="10bit-interior-ramp",
+    ),
+]
+
+
+class TestBroadcastYCbCrRoundTrip:
+    """
+    Test the float *R'G'B'* to narrow-range *Y'CbCr* code word workflow and
+    the editor decode back to float *R'G'B'*.
+    """
+
+    @staticmethod
+    def _quantization_atol(bits: int) -> float:
+        """
+        Return a conservative *R'G'B'* error bound for one rounded code value.
+        """
+
+        scale = 2 ** (bits - 8)
+        half_luma_level = 0.5 / (219 * scale)
+        half_chroma_level = 0.5 / (224 * scale)
+
+        kr, kb = (float(coefficient) for coefficient in WEIGHTS_YCBCR["ITU-R BT.709"])
+        cb_scale, cr_scale = (
+            float(coefficient) for coefficient in SCALES_YCBCR["Y'CbCr"]
+        )
+
+        # The blue channel has the largest direct inverse-matrix chroma gain.
+        largest_gain = max(
+            (1.0 - kb) / cb_scale,
+            (1.0 - kr) / cr_scale,
+            (kb * (1.0 - kb) / cb_scale + kr * (1.0 - kr) / cr_scale) / (1.0 - kr - kb),
+        )
+
+        return half_luma_level + largest_gain * half_chroma_level + 1e-12
+
+    @pytest.mark.parametrize("bits", [8, 10, 12])
+    def test_digital_video_ranges_and_offsets(self, bits: int) -> None:
+        """Test legal-range anchors scale with bit depth, not code maximum."""
+
+        depth_scale = 1 << (bits - 8)
+        code_maximum = (1 << bits) - 1
+        integer_ranges = np.array([16, 235, 16, 240]) * depth_scale
+
+        np.testing.assert_array_equal(
+            ranges_YCbCr(bits, is_legal=True, is_int=True),
+            integer_ranges,
+        )
+        np.testing.assert_allclose(
+            ranges_YCbCr(bits, is_legal=True, is_int=False),
+            integer_ranges / code_maximum,
+            atol=1e-14,
+            rtol=0.0,
+        )
+        np.testing.assert_array_equal(
+            ranges_YCbCr(bits, is_legal=False, is_int=False),
+            [0.0, 1.0, -0.5, 0.5],
+        )
+        np.testing.assert_array_equal(
+            offset_YCbCr(bits=bits, is_legal=True, is_int=True),
+            [16 * depth_scale, 128 * depth_scale, 128 * depth_scale],
+        )
+        np.testing.assert_allclose(
+            offset_YCbCr(bits=bits, is_legal=True, is_int=False),
+            np.array(
+                [16 * depth_scale, 128 * depth_scale, 128 * depth_scale],
+                dtype=float,
+            )
+            / code_maximum,
+            atol=1e-14,
+            rtol=0.0,
+        )
+
+    def test_signed_bt709_luma_and_chroma_axes(self) -> None:
+        """Test primary colours against signed +/- 0.5 chroma scales."""
+
+        signed = RGB_to_YCbCr(
+            np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            K=WEIGHTS_YCBCR["ITU-R BT.709"],
+            out_legal=False,
+            out_int=False,
+        )
+
+        np.testing.assert_allclose(
+            signed,
+            [
+                [0.2126, -0.1145721061, 0.5000000000],
+                [0.7152, -0.3854278939, -0.4541529083],
+                [0.0722, 0.5000000000, -0.0458470917],
+            ],
+            atol=1e-10,
+            rtol=0.0,
+        )
+
+    @pytest.mark.parametrize(("bits", "rgb", "code_words"), BROADCAST_CODE_WORD_PARAMS)
+    def test_standard_integer_code_words(
+        self,
+        bits: int,
+        rgb: np.ndarray,
+        code_words: np.ndarray,
+    ) -> None:
+        """Test exact broadcast code words for both common bit depths."""
+
+        actual = RGB_to_YCbCr(
+            rgb,
+            K=WEIGHTS_YCBCR["ITU-R BT.709"],
+            out_bits=bits,
+            out_legal=True,
+            out_int=True,
+        )
+
+        np.testing.assert_array_equal(actual, code_words)
+        assert np.issubdtype(actual.dtype, np.integer)
+
+    @pytest.mark.parametrize(("bits", "rgb", "code_words"), BROADCAST_CODE_WORD_PARAMS)
+    def test_integer_and_normalised_code_words_denote_sample_colour(
+        self,
+        bits: int,
+        rgb: np.ndarray,
+        code_words: np.ndarray,
+    ) -> None:
+        """Test integer and normalised code values decode to one colour."""
+
+        decoded_integer = YCbCr_to_RGB(
+            code_words,
+            in_bits=bits,
+            in_legal=True,
+            in_int=True,
+        )
+
+        code_maximum = (1 << bits) - 1
+        normalised = code_words.astype(float) / code_maximum
+        decoded_normalised = YCbCr_to_RGB(
+            normalised,
+            in_bits=bits,
+            in_legal=True,
+            in_int=False,
+        )
+
+        np.testing.assert_allclose(
+            decoded_normalised,
+            decoded_integer,
+            atol=1e-12,
+            rtol=0.0,
+        )
+
+        # Dividing by 2**bits and supplying the corresponding video ranges is
+        # another common normalisation, with neutral chroma at exactly 1 / 2.
+        video_normalised = code_words.astype(float) / (1 << bits)
+        decoded_video_normalised = YCbCr_to_RGB(
+            video_normalised,
+            in_range=(16 / 256, 235 / 256, 16 / 256, 240 / 256),
+        )
+
+        np.testing.assert_allclose(
+            decoded_video_normalised,
+            decoded_integer,
+            atol=1e-12,
+            rtol=0.0,
+        )
+
+        np.testing.assert_allclose(
+            decoded_integer,
+            rgb,
+            atol=self._quantization_atol(bits),
+            rtol=0.0,
+        )
+
+    def test_selected_code_words_have_golden_monitor_values(self) -> None:
+        """Test decoded float monitor values independently of round trips."""
+
+        cases = [
+            (8, [16, 128, 128], [0.0, 0.0, 0.0]),
+            (8, [235, 128, 128], [1.0, 1.0, 1.0]),
+            (8, [126, 128, 128], [110 / 219] * 3),
+            (
+                8,
+                [133, 94, 159],
+                [0.75218765, 0.49789467, 0.25259300],
+            ),
+            (
+                8,
+                [63, 102, 240],
+                [1.00201187, 0.00229273, -0.00077027],
+            ),
+            (
+                8,
+                [32, 240, 118],
+                [0.00275579, 0.00029563, 1.00085936],
+            ),
+            (10, [64, 512, 512], [0.0, 0.0, 0.0]),
+            (10, [940, 512, 512], [1.0, 1.0, 1.0]),
+            (10, [502, 512, 512], [0.5, 0.5, 0.5]),
+            (
+                10,
+                [533, 374, 634],
+                [0.74981402, 0.50049928, 0.24959259],
+            ),
+            (
+                10,
+                [250, 409, 960],
+                [0.99972877, -0.00019944, -0.00098239],
+            ),
+            (
+                10,
+                [127, 960, 471],
+                [-0.00014335, -0.00032346, 0.99971781],
+            ),
+        ]
+
+        for bits, code_words, expected_rgb in cases:
+            np.testing.assert_allclose(
+                YCbCr_to_RGB(
+                    np.array(code_words),
+                    in_bits=bits,
+                    in_legal=True,
+                    in_int=True,
+                ),
+                expected_rgb,
+                atol=1e-8,
+                rtol=0.0,
+            )
+
+    @pytest.mark.parametrize(("bits", "rgb", "code_words"), BROADCAST_CODE_WORD_PARAMS)
+    def test_legal_float_range_itself_does_not_change_colour(
+        self,
+        bits: int,
+        rgb: np.ndarray,
+        code_words: np.ndarray,
+    ) -> None:
+        """Test unquantized legal-range conversion is numerically reversible."""
+
+        legal_float = RGB_to_YCbCr(
+            rgb,
+            K=WEIGHTS_YCBCR["ITU-R BT.709"],
+            out_bits=bits,
+            out_legal=True,
+            out_int=False,
+        )
+        code_maximum = (1 << bits) - 1
+
+        np.testing.assert_allclose(
+            legal_float,
+            code_words.astype(float) / code_maximum,
+            atol=0.5 / code_maximum + 1e-12,
+            rtol=0.0,
+        )
+
+        np.testing.assert_allclose(
+            YCbCr_to_RGB(
+                legal_float,
+                in_bits=bits,
+                in_legal=True,
+                in_int=False,
+            ),
+            rgb,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+            rtol=0.0,
+        )
+
+    @pytest.mark.parametrize(("bits", "rgb", "code_words"), BROADCAST_CODE_WORD_PARAMS)
+    def test_range_misinterpretation_is_larger_than_quantization(
+        self,
+        bits: int,
+        rgb: np.ndarray,
+        code_words: np.ndarray,
+    ) -> None:
+        """
+        Test quantization error and a colour-changing range mismatch are
+        distinguishable.
+        """
+
+        quantized_rgb = YCbCr_to_RGB(
+            code_words,
+            in_bits=bits,
+            in_legal=True,
+            in_int=True,
+        )
+        quantization_error = np.max(np.abs(quantized_rgb - rgb))
+        quantization_atol = self._quantization_atol(bits)
+
+        assert quantization_error <= quantization_atol
+
+        normalised = code_words.astype(float) / ((1 << bits) - 1)
+        full_swing_rgb = YCbCr_to_RGB(
+            normalised,
+            in_bits=bits,
+            # Unsigned [0, 1] chroma span centered on 1 / 2, the range
+            # conversion a legal-range tag must prevent.
+            in_range=(0.0, 1.0, 0.0, 1.0),
+        )
+        range_error = np.max(np.abs(full_swing_rgb - rgb))
+
+        assert range_error > quantization_atol
+
+    @pytest.mark.parametrize("bits", [8, 10, 12])
+    def test_guard_band_inputs_keep_extended_colour(self, bits: int) -> None:
+        """Test super-black and super-white broadcast guard bands survive."""
+
+        depth_scale = 1 << (bits - 8)
+        foot_room_rgb = np.array([-16 / 219] * 3)
+        head_room_rgb = np.array([239 / 219] * 3)
+        cases = [
+            (foot_room_rgb, [0, 128 * depth_scale, 128 * depth_scale]),
+            (
+                head_room_rgb,
+                [255 * depth_scale, 128 * depth_scale, 128 * depth_scale],
+            ),
+        ]
+
+        for rgb, expected_codes in cases:
+            code_words = RGB_to_YCbCr(
+                rgb,
+                out_bits=bits,
+                out_legal=True,
+                out_int=True,
+            )
+
+            np.testing.assert_array_equal(code_words, expected_codes)
+            np.testing.assert_allclose(
+                YCbCr_to_RGB(
+                    code_words,
+                    in_bits=bits,
+                    in_legal=True,
+                    in_int=True,
+                ),
+                rgb,
+                atol=1e-12,
+                rtol=0.0,
+            )
 
 
 class TestRGB_to_YcCbcCrc:
