@@ -10,9 +10,18 @@ if typing.TYPE_CHECKING:
 from itertools import product
 
 import numpy as np
+import pytest
 
 from colour.constants import TOLERANCE_ABSOLUTE_TESTS
 from colour.models.rgb import ICtCp_to_RGB, ICtCp_to_XYZ, RGB_to_ICtCp, XYZ_to_ICtCp
+from colour.models.rgb.ictcp import (
+    MATRIX_ICTCP_LMS_P_TO_ICTCP,
+    MATRIX_ICTCP_LMS_P_TO_ICTCP_BT2100_HLG_2,
+)
+from colour.models.rgb.transfer_functions import (
+    oetf_BT2100_HLG,
+    oetf_inverse_BT2100_HLG,
+)
 from colour.utilities import (
     as_ndarray,
     domain_range_scale,
@@ -34,7 +43,48 @@ __all__ = [
     "TestICtCp_to_RGB",
     "TestXYZ_to_ICtCp",
     "TestICtCp_to_XYZ",
+    "TestBT2100DeliverySemantics",
 ]
+
+_BT2100_PQ_METHOD = "ITU-R BT.2100-2 PQ"
+_BT2100_HLG_V1_METHOD = "ITU-R BT.2100-1 HLG"
+_BT2100_HLG_V2_METHOD = "ITU-R BT.2100-2 HLG"
+
+_DELIVERY_METHODS = (
+    _BT2100_PQ_METHOD,
+    _BT2100_HLG_V1_METHOD,
+    _BT2100_HLG_V2_METHOD,
+)
+
+# A saturated BT.2020 highlight in linear scene/display light.  The values are
+# exposure coordinates, not non-linear R'G'B' code values.
+_COLOURED_HIGHLIGHT = [1.0, 0.25, 0.05]
+
+# Standard component oracles for that highlight.  Round-tripping these vectors
+# is useful but cannot establish that the selected BT.2100 variant was used.
+_COLOURED_HIGHLIGHT_REFERENCES = (
+    pytest.param(
+        _BT2100_PQ_METHOD,
+        [0.11223650, -0.04619242, 0.08518316],
+        id="bt2100-2-pq",
+    ),
+    pytest.param(
+        _BT2100_HLG_V1_METHOD,
+        [0.84679821, -0.36508506, 0.40147240],
+        id="bt2100-1-hlg",
+    ),
+    pytest.param(
+        _BT2100_HLG_V2_METHOD,
+        [0.84679821, -0.20017940, 0.21270449],
+        id="bt2100-2-hlg",
+    ),
+)
+
+_BT2020_PRIMARY_DIRECTIONS = (
+    pytest.param([1.0, 0.0, 0.0], id="bt2020-red"),
+    pytest.param([0.0, 1.0, 0.0], id="bt2020-green"),
+    pytest.param([0.0, 0.0, 1.0], id="bt2020-blue"),
+)
 
 
 class TestRGB_to_ICtCp:
@@ -529,3 +579,240 @@ class TestICtCp_to_XYZ:
         cases = [-1.0, 0.0, 1.0, -np.inf, np.inf, np.nan]
         cases = np.array(list(set(product(cases, repeat=3))))
         ICtCp_to_XYZ(cases)
+
+
+class TestBT2100DeliverySemantics:
+    """
+    Define standard-delivery and HDR master-exposure conformance tests for
+    :mod:`colour.models.rgb.ictcp`.
+    """
+
+    @pytest.mark.parametrize(
+        ("method", "components"),
+        _COLOURED_HIGHLIGHT_REFERENCES,
+    )
+    def test_highlight_components_match_selected_bt2100_variant(
+        self,
+        xp: ModuleType,
+        method: str,
+        components: list[float],
+    ) -> None:
+        """
+        Test that the intensity and two chroma components use the matrices
+        prescribed by the selected *BT.2100* variant.
+        """
+
+        master = xp_as_array(_COLOURED_HIGHLIGHT, xp=xp)
+        delivered = RGB_to_ICtCp(master, method=method)
+
+        xp_assert_close(
+            delivered,
+            xp_as_array(components, xp=xp),
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+        xp_assert_close(
+            ICtCp_to_RGB(delivered, method=method),
+            master,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+    def test_hlg_component_matrices_match_standard_coefficients(self) -> None:
+        """
+        Test the version-specific *HLG* intensity and chroma matrix rows.
+        """
+
+        xp_assert_close(
+            MATRIX_ICTCP_LMS_P_TO_ICTCP,
+            np.array(
+                [
+                    [2048, 2048, 0],
+                    [6610, -13613, 7003],
+                    [17933, -17390, -543],
+                ],
+                dtype=float,
+            )
+            / 4096,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+        xp_assert_close(
+            MATRIX_ICTCP_LMS_P_TO_ICTCP_BT2100_HLG_2,
+            np.array(
+                [
+                    [2048, 2048, 0],
+                    [3625, -7465, 3840],
+                    [9500, -9212, -288],
+                ],
+                dtype=float,
+            )
+            / 4096,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+    @pytest.mark.parametrize("method", _DELIVERY_METHODS)
+    @pytest.mark.parametrize("primary", _BT2020_PRIMARY_DIRECTIONS)
+    @pytest.mark.parametrize("exposure", [0.2, 1.0, 1.8])
+    def test_wcg_primary_highlights_restore_master_exposure(
+        self,
+        xp: ModuleType,
+        method: str,
+        primary: list[float],
+        exposure: float,
+    ) -> None:
+        """
+        Test that each *BT.2020* primary direction remains the same linear
+        master colour when recovered from its delivered components.
+        """
+
+        master = xp_as_array(exposure * np.asarray(primary, dtype=float), xp=xp)
+
+        delivered = RGB_to_ICtCp(master, method=method)
+        restored = ICtCp_to_RGB(delivered, method=method)
+
+        xp_assert_close(restored, master, atol=TOLERANCE_ABSOLUTE_TESTS)
+        xp_assert_close(
+            as_ndarray(restored).max(),
+            exposure,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+    @pytest.mark.parametrize("method", _DELIVERY_METHODS)
+    @pytest.mark.parametrize("primary", _BT2020_PRIMARY_DIRECTIONS)
+    def test_linear_exposure_scaling_and_signal_component_scaling_differ(
+        self,
+        xp: ModuleType,
+        method: str,
+        primary: list[float],
+    ) -> None:
+        """
+        Test that doubling linear exposure doubles recovered master light but
+        does not double the non-linear delivered components.
+        """
+
+        half_exposure = xp_as_array(0.45 * np.asarray(primary, dtype=float), xp=xp)
+        full_exposure = xp_as_array(0.90 * np.asarray(primary, dtype=float), xp=xp)
+
+        half_delivered = RGB_to_ICtCp(half_exposure, method=method)
+        full_delivered = RGB_to_ICtCp(full_exposure, method=method)
+
+        half_restored = ICtCp_to_RGB(half_delivered, method=method)
+        full_restored = ICtCp_to_RGB(full_delivered, method=method)
+
+        xp_assert_close(
+            full_restored,
+            2 * half_restored,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+        component_nonlinearity = as_ndarray(full_delivered) - 2 * as_ndarray(
+            half_delivered
+        )
+        assert np.linalg.norm(component_nonlinearity) > 1.0e-2
+
+    def test_bt2100_1_hlg_roundtrip_is_not_bt2100_2_conformant(
+        self,
+        xp: ModuleType,
+    ) -> None:
+        """
+        Test that a self-consistent *BT.2100-1 HLG* codec is rejected by the
+        *BT.2100-2 HLG* component oracle and recovers the wrong master when
+        decoded as the latter.
+        """
+
+        master = xp_as_array(_COLOURED_HIGHLIGHT, xp=xp)
+        expected_bt2100_2 = [0.84679821, -0.20017940, 0.21270449]
+
+        bt2100_1 = RGB_to_ICtCp(master, method=_BT2100_HLG_V1_METHOD)
+        bt2100_2 = RGB_to_ICtCp(master, method=_BT2100_HLG_V2_METHOD)
+
+        # The old and new HLG matrices share the intensity row but prescribe
+        # different C_T and C_P coefficients.
+        xp_assert_close(bt2100_2[0], bt2100_1[0], atol=TOLERANCE_ABSOLUTE_TESTS)
+        assert not np.allclose(
+            as_ndarray(bt2100_2)[1:],
+            as_ndarray(bt2100_1)[1:],
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+        # BT.2100-1 is internally round-trip consistent, so a round-trip-only
+        # test cannot distinguish it from the required BT.2100-2 delivery.
+        xp_assert_close(
+            ICtCp_to_RGB(bt2100_1, method=_BT2100_HLG_V1_METHOD),
+            master,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+        with pytest.raises(AssertionError):
+            xp_assert_close(
+                bt2100_1,
+                xp_as_array(expected_bt2100_2, xp=xp),
+                atol=TOLERANCE_ABSOLUTE_TESTS,
+            )
+
+        xp_assert_close(
+            bt2100_2,
+            xp_as_array(expected_bt2100_2, xp=xp),
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+        version_mismatched_master = ICtCp_to_RGB(
+            bt2100_2,
+            method=_BT2100_HLG_V1_METHOD,
+        )
+        assert (
+            np.max(np.abs(as_ndarray(version_mismatched_master) - as_ndarray(master)))
+            > 1.0e-1
+        )
+
+    @pytest.mark.parametrize("primary", _BT2020_PRIMARY_DIRECTIONS)
+    def test_hlg_primary_codes_are_distinct_from_linear_light_values(
+        self,
+        xp: ModuleType,
+        primary: list[float],
+    ) -> None:
+        """
+        Test that the same *BT.2020* primary direction denotes proportional
+        light at the master end but non-linear code values after HLG encoding.
+        """
+
+        linear_master = xp_as_array(
+            1.8 * np.asarray(primary, dtype=float),
+            xp=xp,
+        )
+        signal_codes = oetf_BT2100_HLG(linear_master)
+
+        assert (
+            np.linalg.norm(as_ndarray(signal_codes) - as_ndarray(linear_master))
+            > 5.0e-1
+        )
+
+        decoded_linear = oetf_inverse_BT2100_HLG(signal_codes)
+        xp_assert_close(
+            decoded_linear,
+            linear_master,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+        standard_delivery = RGB_to_ICtCp(
+            linear_master,
+            method=_BT2100_HLG_V2_METHOD,
+        )
+        xp_assert_close(
+            RGB_to_ICtCp(decoded_linear, method=_BT2100_HLG_V2_METHOD),
+            standard_delivery,
+            atol=TOLERANCE_ABSOLUTE_TESTS,
+        )
+
+        # Feeding the signal codes back in as linear light applies the
+        # encoding a second time and does not produce the standard delivery.
+        signal_codes_as_linear = RGB_to_ICtCp(
+            signal_codes,
+            method=_BT2100_HLG_V2_METHOD,
+        )
+        assert (
+            np.max(
+                np.abs(
+                    as_ndarray(signal_codes_as_linear) - as_ndarray(standard_delivery)
+                )
+            )
+            > 5.0e-2
+        )
